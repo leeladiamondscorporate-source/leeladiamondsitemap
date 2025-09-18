@@ -1,0 +1,86 @@
+name: 🗓️ Daily Sitemap Build & Publish
+
+on:
+  schedule:
+    - cron: "0 1 * * *"   # 01:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+
+    env:
+      GCS_BUCKET: sitemaps.leeladiamond.com
+      OUTPUT_DIR: ./sitemaps_out
+      SITEMAP_INDEX_URL: https://leeladiamond.com/sitemaps/sitemap-index.xml
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (if any)
+        run: |
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+          fi
+
+      # --- Google Cloud auth (Service Account JSON in GCP_SA_KEY secret) ---
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: "gsutil"
+
+      # --- Generate your sitemaps into OUTPUT_DIR ---
+      - name: Generate sitemaps
+        run: |
+          mkdir -p "${OUTPUT_DIR}"
+          # TODO: replace with your real generator command:
+          # python tools/sitemapgen/main.py \
+          #   --csv "https://storage.googleapis.com/sitemaps.leeladiamond.com/Googlefinal/combined_google_merchant_feed.csv" \
+          #   --outdir "${OUTPUT_DIR}" \
+          #   --public-base-url "https://leeladiamond.com/sitemaps" \
+          #   --per-file 50000
+          echo "Put your generator command here"
+
+      - name: Verify output exists
+        run: |
+          test -d "${OUTPUT_DIR}" || (echo "Missing ${OUTPUT_DIR}" && exit 1)
+          ls -la "${OUTPUT_DIR}"
+          test -f "${OUTPUT_DIR}/sitemap-index.xml" || (echo "sitemap-index.xml missing" && exit 1)
+
+      # --- Upload to GCS bucket path /sitemaps ---
+      - name: Upload sitemaps to GCS
+        run: |
+          gsutil -m rsync -r -d "${OUTPUT_DIR}" "gs://${GCS_BUCKET}/sitemaps"
+
+      - name: Set Cache-Control headers (optional)
+        run: |
+          gsutil -m setmeta -h "Cache-Control:public, max-age=3600" "gs://${GCS_BUCKET}/sitemaps/*.xml" || true
+          gsutil -m setmeta -h "Cache-Control:public, max-age=3600" "gs://${GCS_BUCKET}/sitemaps/*.xml.gz" || true
+
+      # --- Purge Cloudflare cache for the index so Google sees latest immediately ---
+      - name: Purge Cloudflare cache
+        if: ${{ env.CF_ZONE_ID != '' && env.CF_API_TOKEN != '' }}
+        run: |
+          curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "{\"files\":[\"${SITEMAP_INDEX_URL}\"]}" \
+            | tee /tmp/cf_purge.json
+          echo "Cloudflare purge response:" && cat /tmp/cf_purge.json
