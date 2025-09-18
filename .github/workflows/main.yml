@@ -13,9 +13,19 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      # ===== customize these =====
+      CSV_URL: https://storage.googleapis.com/sitemaps.leeladiamond.com/Googlefinal/combined_google_merchant_feed.csv
+      LINK_COL: link
       GCS_BUCKET: sitemaps.leeladiamond.com
       OUTPUT_DIR: ./sitemaps_out
-      SITEMAP_INDEX_URL: https://leeladiamond.com/sitemaps/sitemap-index.xml
+      PUBLIC_BASE_URL: https://leeladiamond.com/sitemaps
+      PER_FILE: "50000"
+      SITEMAP_INDEX_NAME: sitemap-index.xml
+      SITEMAP_GLOB: "leela-products-*.xml"
+      SITEMAP_PREFIX: leela-products-
+      # ===========================
+
+      # Secrets (add in repo Settings → Secrets and variables → Actions)
       CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
 
@@ -28,59 +38,133 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (if any)
+      - name: Install Python deps
         run: |
-          if [ -f requirements.txt ]; then
-            python -m pip install --upgrade pip
-            pip install -r requirements.txt
-          fi
+          python -m pip install --upgrade pip
+          pip install pandas lxml
 
-      # --- Google Cloud auth (Service Account JSON in GCP_SA_KEY secret) ---
+      # ---------- AUTH TO GCP ----------
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Setup gcloud SDK
+      - name: Setup gcloud SDK (gsutil)
         uses: google-github-actions/setup-gcloud@v2
         with:
           install_components: "gsutil"
 
-      # --- Generate your sitemaps into OUTPUT_DIR ---
-      - name: Generate sitemaps
+      # ---------- GENERATE SITEMAPS ----------
+      - name: Generate sitemaps from CSV (inline Python)
+        env:
+          CSV_URL: ${{ env.CSV_URL }}
+          OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
+          PUBLIC_BASE_URL: ${{ env.PUBLIC_BASE_URL }}
+          PER_FILE: ${{ env.PER_FILE }}
+          LINK_COL: ${{ env.LINK_COL }}
+          SITEMAP_PREFIX: ${{ env.SITEMAP_PREFIX }}
+          SITEMAP_INDEX_NAME: ${{ env.SITEMAP_INDEX_NAME }}
         run: |
-          mkdir -p "${OUTPUT_DIR}"
-          # TODO: replace with your real generator command:
-          # python tools/sitemapgen/main.py \
-          #   --csv "https://storage.googleapis.com/sitemaps.leeladiamond.com/Googlefinal/combined_google_merchant_feed.csv" \
-          #   --outdir "${OUTPUT_DIR}" \
-          #   --public-base-url "https://leeladiamond.com/sitemaps" \
-          #   --per-file 50000
-          echo "Put your generator command here"
+          python - <<'PY'
+          # -*- coding: utf-8 -*-
+          import os, sys, math, csv, gzip, datetime
+          import pandas as pd
+
+          CSV_URL = os.environ["CSV_URL"]
+          OUTPUT_DIR = os.environ["OUTPUT_DIR"]
+          PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
+          PER_FILE = int(os.environ.get("PER_FILE", "50000"))
+          LINK_COL = os.environ.get("LINK_COL", "link")
+          SITEMAP_PREFIX = os.environ.get("SITEMAP_PREFIX", "leela-products-")
+          SITEMAP_INDEX_NAME = os.environ.get("SITEMAP_INDEX_NAME", "sitemap-index.xml")
+
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+          def iter_links(csv_source, link_col="link", chunksize=200000):
+            # Stream read (handles very large CSV)
+            for chunk in pd.read_csv(csv_source, dtype=str, usecols=[link_col], chunksize=chunksize):
+              for url in chunk[link_col].dropna().astype(str):
+                url = url.strip()
+                if url:
+                  yield url
+
+          def write_urlset_xml(file_path, urls):
+            # Write a single sitemap XML file from a list of URLs
+            with open(file_path, "w", encoding="utf-8", newline="") as f:
+              f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+              f.write('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
+              for u in urls:
+                f.write("  <url>\n")
+                f.write(f"    <loc>{u}</loc>\n")
+                f.write("  </url>\n")
+              f.write("</urlset>\n")
+
+          def write_index_xml(index_path, part_files):
+            now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+            with open(index_path, "w", encoding="utf-8", newline="") as f:
+              f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+              f.write('<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
+              for name in part_files:
+                loc = f"{PUBLIC_BASE_URL}/{name}"
+                f.write("  <sitemap>\n")
+                f.write(f"    <loc>{loc}</loc>\n")
+                f.write(f"    <lastmod>{now}</lastmod>\n")
+                f.write("  </sitemap>\n")
+              f.write("</sitemapindex>\n")
+
+          links_iter = iter_links(CSV_URL, LINK_COL)
+          buffer, part_names = [], []
+          count, part = 0, 1
+
+          for url in links_iter:
+            buffer.append(url)
+            count += 1
+            if len(buffer) >= PER_FILE:
+              part_name = f"{SITEMAP_PREFIX}{part:05d}.xml"
+              write_urlset_xml(os.path.join(OUTPUT_DIR, part_name), buffer)
+              part_names.append(part_name)
+              buffer.clear()
+              part += 1
+
+          if buffer:
+            part_name = f"{SITEMAP_PREFIX}{part:05d}.xml"
+            write_urlset_xml(os.path.join(OUTPUT_DIR, part_name), buffer)
+            part_names.append(part_name)
+
+          index_path = os.path.join(OUTPUT_DIR, SITEMAP_INDEX_NAME)
+          write_index_xml(index_path, part_names)
+
+          print(f"Generated {len(part_names)} sitemap part files; index at {index_path}")
+          PY
 
       - name: Verify output exists
         run: |
           test -d "${OUTPUT_DIR}" || (echo "Missing ${OUTPUT_DIR}" && exit 1)
           ls -la "${OUTPUT_DIR}"
-          test -f "${OUTPUT_DIR}/sitemap-index.xml" || (echo "sitemap-index.xml missing" && exit 1)
+          if ! ls "${OUTPUT_DIR}/${SITEMAP_INDEX_NAME}" >/dev/null 2>&1; then
+            echo "${SITEMAP_INDEX_NAME} not found in ${OUTPUT_DIR}" && exit 1
+          fi
 
-      # --- Upload to GCS bucket path /sitemaps ---
-      - name: Upload sitemaps to GCS
+      # ---------- UPLOAD TO GCS ----------
+      - name: Upload sitemaps to GCS (to /sitemaps/)
         run: |
           gsutil -m rsync -r -d "${OUTPUT_DIR}" "gs://${GCS_BUCKET}/sitemaps"
 
-      - name: Set Cache-Control headers (optional)
+      - name: Set Cache-Control & Content-Type (optional)
         run: |
           gsutil -m setmeta -h "Cache-Control:public, max-age=3600" "gs://${GCS_BUCKET}/sitemaps/*.xml" || true
           gsutil -m setmeta -h "Cache-Control:public, max-age=3600" "gs://${GCS_BUCKET}/sitemaps/*.xml.gz" || true
 
-      # --- Purge Cloudflare cache for the index so Google sees latest immediately ---
-      - name: Purge Cloudflare cache
+      # ---------- PURGE CLOUDFLARE CACHE ----------
+      - name: Purge Cloudflare cache for sitemap index
         if: ${{ env.CF_ZONE_ID != '' && env.CF_API_TOKEN != '' }}
+        env:
+          CF_ZONE_ID: ${{ env.CF_ZONE_ID }}
+          CF_API_TOKEN: ${{ env.CF_API_TOKEN }}
+          SITEMAP_INDEX_URL: ${{ env.PUBLIC_BASE_URL }}/${{ env.SITEMAP_INDEX_NAME }}
         run: |
           curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            --data "{\"files\":[\"${SITEMAP_INDEX_URL}\"]}" \
-            | tee /tmp/cf_purge.json
+            --data "{\"files\":[\"${SITEMAP_INDEX_URL}\"]}" | tee /tmp/cf_purge.json
           echo "Cloudflare purge response:" && cat /tmp/cf_purge.json
