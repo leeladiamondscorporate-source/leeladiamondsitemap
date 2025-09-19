@@ -18,16 +18,11 @@ jobs:
       LINK_COL: link
       GCS_BUCKET: sitemaps.leeladiamond.com
       OUTPUT_DIR: ./sitemaps_out
-      PUBLIC_BASE_URL: https://leeladiamond.com/sitemaps
+      PUBLIC_BASE_URL: https://www.leeladiamond.com/sitemaps
       PER_FILE: "50000"
       SITEMAP_INDEX_NAME: sitemap-index.xml
-      SITEMAP_GLOB: "leela-products-*.xml"
       SITEMAP_PREFIX: leela-products-
       # ===========================
-
-      # Secrets (add in repo Settings → Secrets and variables → Actions)
-      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
-      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
 
     steps:
       - name: Checkout repo
@@ -38,10 +33,40 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-v1-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-v1-
+
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas lxml
+          pip install pandas lxml requests
+
+      # ---------- QUICK INPUT CHECKS ----------
+      - name: Check CSV is reachable and has the column
+        env:
+          CSV_URL: ${{ env.CSV_URL }}
+          LINK_COL: ${{ env.LINK_COL }}
+        run: |
+          python - <<'PY'
+          import os, sys, pandas as pd
+          url = os.environ["CSV_URL"]
+          link_col = os.environ.get("LINK_COL", "link")
+          try:
+              # sample small chunk to confirm column exists
+              df = pd.read_csv(url, dtype=str, nrows=5)
+          except Exception as e:
+              print(f"ERROR: Can't read CSV: {e}")
+              sys.exit(1)
+          if link_col not in df.columns:
+              print(f"ERROR: Column '{link_col}' not found in CSV. Found: {list(df.columns)}")
+              sys.exit(1)
+          print("CSV reachable and column present.")
+          PY
 
       # ---------- AUTH TO GCP ----------
       - name: Authenticate to Google Cloud
@@ -55,7 +80,7 @@ jobs:
           install_components: "gsutil"
 
       # ---------- GENERATE SITEMAPS ----------
-      - name: Generate sitemaps from CSV (inline Python)
+      - name: Generate sitemaps from CSV (streaming, memory-safe)
         env:
           CSV_URL: ${{ env.CSV_URL }}
           OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
@@ -67,7 +92,7 @@ jobs:
         run: |
           python - <<'PY'
           # -*- coding: utf-8 -*-
-          import os, sys, math, csv, gzip, datetime
+          import os, sys, datetime
           import pandas as pd
 
           CSV_URL = os.environ["CSV_URL"]
@@ -80,20 +105,22 @@ jobs:
 
           os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-          def iter_links(csv_source, link_col="link", chunksize=200000):
+          def iter_links(csv_source, link_col="link", chunksize=200_000):
             # Stream read (handles very large CSV)
             for chunk in pd.read_csv(csv_source, dtype=str, usecols=[link_col], chunksize=chunksize):
-              for url in chunk[link_col].dropna().astype(str):
-                url = url.strip()
-                if url:
-                  yield url
+              series = chunk[link_col].dropna().astype(str).str.strip()
+              for url in series[series.ne("")]:
+                yield url
 
           def write_urlset_xml(file_path, urls):
-            # Write a single sitemap XML file from a list of URLs
             with open(file_path, "w", encoding="utf-8", newline="") as f:
               f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
               f.write('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
               for u in urls:
+                # Basic XML-escape for & < >
+                u = (u.replace("&","&amp;")
+                       .replace("<","&lt;")
+                       .replace(">","&gt;"))
                 f.write("  <url>\n")
                 f.write(f"    <loc>{u}</loc>\n")
                 f.write("  </url>\n")
@@ -131,6 +158,10 @@ jobs:
             write_urlset_xml(os.path.join(OUTPUT_DIR, part_name), buffer)
             part_names.append(part_name)
 
+          if not part_names:
+            print("ERROR: No URLs found. Aborting.")
+            sys.exit(1)
+
           index_path = os.path.join(OUTPUT_DIR, SITEMAP_INDEX_NAME)
           write_index_xml(index_path, part_names)
 
@@ -138,31 +169,48 @@ jobs:
           PY
 
       - name: Verify output exists
+        env:
+          OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
+          SITEMAP_INDEX_NAME: ${{ env.SITEMAP_INDEX_NAME }}
         run: |
           test -d "${OUTPUT_DIR}" || (echo "Missing ${OUTPUT_DIR}" && exit 1)
           ls -la "${OUTPUT_DIR}"
-          if ! ls "${OUTPUT_DIR}/${SITEMAP_INDEX_NAME}" >/dev/null 2>&1; then
-            echo "${SITEMAP_INDEX_NAME} not found in ${OUTPUT_DIR}" && exit 1
-          fi
+          test -f "${OUTPUT_DIR}/${SITEMAP_INDEX_NAME}" || (echo "${SITEMAP_INDEX_NAME} not found" && exit 1)
+
+      - name: Upload sitemap artifacts (for debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-sitemaps
+          path: ${{ env.OUTPUT_DIR }}
+          if-no-files-found: error
+          retention-days: 5
 
       # ---------- UPLOAD TO GCS ----------
-      - name: Upload sitemaps to GCS (to /sitemaps/)
+      - name: Upload sitemaps to GCS (/sitemaps/)
+        env:
+          GCS_BUCKET: ${{ env.GCS_BUCKET }}
+          OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
         run: |
           gsutil -m rsync -r -d "${OUTPUT_DIR}" "gs://${GCS_BUCKET}/sitemaps"
 
-      - name: Set Cache-Control & Content-Type (optional)
-        run: |
-          gsutil -m setmeta -h "Cache-Control:public, max-age=3600" "gs://${GCS_BUCKET}/sitemaps/*.xml" || true
-          gsutil -m setmeta -h "Cache-Control:public, max-age=3600" "gs://${GCS_BUCKET}/sitemaps/*.xml.gz" || true
-
-      # ---------- PURGE CLOUDFLARE CACHE ----------
-      - name: Purge Cloudflare cache for sitemap index
-        if: ${{ env.CF_ZONE_ID != '' && env.CF_API_TOKEN != '' }}
+      - name: Set Cache-Control & Content-Type
         env:
-          CF_ZONE_ID: ${{ env.CF_ZONE_ID }}
-          CF_API_TOKEN: ${{ env.CF_API_TOKEN }}
+          GCS_BUCKET: ${{ env.GCS_BUCKET }}
+        run: |
+          gsutil -m setmeta \
+            -h "Cache-Control:public, max-age=3600" \
+            -h "Content-Type:application/xml; charset=utf-8" \
+            "gs://${GCS_BUCKET}/sitemaps/*.xml" || true
+
+      # ---------- PURGE CLOUDFLARE CACHE (optional) ----------
+      - name: Purge Cloudflare cache for sitemap index
+        if: ${{ secrets.CF_ZONE_ID != '' && secrets.CF_API_TOKEN != '' }}
+        env:
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           SITEMAP_INDEX_URL: ${{ env.PUBLIC_BASE_URL }}/${{ env.SITEMAP_INDEX_NAME }}
         run: |
+          echo "Purging Cloudflare cache for ${SITEMAP_INDEX_URL}"
           curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
