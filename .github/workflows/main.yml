@@ -84,8 +84,11 @@ jobs:
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: |
+          # Purge the index and all part files (wildcards supported for Enterprise; otherwise purge index
+          # and a sample of parts or switch to a KV list). Here we purge the whole /sitemaps/ path via API.
           curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            --data '{"purge_everything":false,"files":["https://www.leeladiamond.com/sitemaps/"]}' | tee /tmp/cf_purge.json
+            --data '{"purge_everything":false,"files":["https://www.leeladiamond.com/sitemaps/sitemap-index.xml","https://www.leeladiamond.com/sitemaps/"]}' \
+            | tee /tmp/cf_purge.json
           echo "Cloudflare purge response:" && cat /tmp/cf_purge.json
