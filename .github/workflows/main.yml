@@ -2,7 +2,7 @@ name: 🗓️ Daily Sitemap Build & Publish
 
 on:
   schedule:
-    - cron: "0 1 * * *"   # 01:00 UTC daily
+    - cron: "0 1 * * *"   # every day at 01:00 UTC
   workflow_dispatch:
 
 permissions:
@@ -24,10 +24,6 @@ jobs:
       SITEMAP_PREFIX: leela-products-
       # ===========================
 
-      # Secrets (set in repo → Settings → Secrets and variables → Actions)
-      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
-      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -40,7 +36,7 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas lxml
+          pip install pandas lxml requests
 
       # ---------- AUTH TO GCP ----------
       - name: Authenticate to Google Cloud
@@ -54,115 +50,42 @@ jobs:
           install_components: "gsutil"
 
       # ---------- GENERATE SITEMAPS ----------
-      - name: Generate sitemaps from CSV (inline Python)
-        env:
-          CSV_URL: ${{ env.CSV_URL }}
-          OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
-          PUBLIC_BASE_URL: ${{ env.PUBLIC_BASE_URL }}
-          PER_FILE: ${{ env.PER_FILE }}
-          LINK_COL: ${{ env.LINK_COL }}
-          SITEMAP_PREFIX: ${{ env.SITEMAP_PREFIX }}
-          SITEMAP_INDEX_NAME: ${{ env.SITEMAP_INDEX_NAME }}
+      - name: Generate sitemaps
         run: |
-          # -*- coding: utf-8 -*-
-          import os, datetime
-          import pandas as pd
-          from urllib.parse import urlparse, urlunparse
-
-          CSV_URL = os.environ["CSV_URL"]
-          OUTPUT_DIR = os.environ["OUTPUT_DIR"]
-          PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
-          PER_FILE = int(os.environ.get("PER_FILE", "50000"))
-          LINK_COL = os.environ.get("LINK_COL", "link")
-          SITEMAP_PREFIX = os.environ.get("SITEMAP_PREFIX", "leela-products-")
-          SITEMAP_INDEX_NAME = os.environ.get("SITEMAP_INDEX_NAME", "sitemap-index.xml")
-
-          WWW_HOST = "www.leeladiamond.com"
-
-          def normalize_url(u: str) -> str:
-              u = (u or "").strip()
-              if not u:
-                  return u
-              p = urlparse(u)
-              # Force https and www host
-              if p.netloc.endswith("leeladiamond.com"):
-                  p = p._replace(scheme="https", netloc=WWW_HOST)
-              return urlunparse(p._replace(query="", fragment=""))
-
-          os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-          def iter_links(csv_source, link_col="link", chunksize=200000):
-              for chunk in pd.read_csv(csv_source, dtype=str, usecols=[link_col], chunksize=chunksize):
-                  for url in chunk[link_col].dropna().astype(str):
-                      url = normalize_url(url)
-                      if url:
-                          yield url
-
-          def write_urlset_xml(file_path, urls):
-              with open(file_path, "w", encoding="utf-8") as f:
-                  f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-                  f.write('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
-                  for u in urls:
-                      f.write("  <url>\n")
-                      f.write(f"    <loc>{u}</loc>\n")
-                      f.write("  </url>\n")
-                  f.write("</urlset>\n")
-
-          def write_index_xml(index_path, part_files):
-              now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-              with open(index_path, "w", encoding="utf-8") as f:
-                  f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-                  f.write('<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
-                  for name in part_files:
-                      loc = f"{PUBLIC_BASE_URL}/{name}"
-                      f.write("  <sitemap>\n")
-                      f.write(f"    <loc>{loc}</loc>\n")
-                      f.write(f"    <lastmod>{now}</lastmod>\n")
-                      f.write("  </sitemap>\n")
-                  f.write("</sitemapindex>\n")
-
-          links_iter = iter_links(CSV_URL, LINK_COL)
-          buffer, part_names = [], []
-          part = 1
-
-          for url in links_iter:
-              buffer.append(url)
-              if len(buffer) >= PER_FILE:
-                  part_name = f"{SITEMAP_PREFIX}{part:05d}.xml"
-                  write_urlset_xml(os.path.join(OUTPUT_DIR, part_name), buffer)
-                  part_names.append(part_name)
-                  buffer.clear()
-                  part += 1
-
-          if buffer:
-              part_name = f"{SITEMAP_PREFIX}{part:05d}.xml"
-              write_urlset_xml(os.path.join(OUTPUT_DIR, part_name), buffer)
-              part_names.append(part_name)
-
-          index_path = os.path.join(OUTPUT_DIR, SITEMAP_INDEX_NAME)
-          write_index_xml(index_path, part_names)
-
-          print(f"Generated {len(part_names)} sitemap files; index at {index_path}")
+          python generate_sitemaps.py \
+            --csv "$CSV_URL" \
+            --outdir "$OUTPUT_DIR" \
+            --basename "$SITEMAP_PREFIX" \
+            --per-file "$PER_FILE" \
+            --public-base-url "$PUBLIC_BASE_URL" \
+            --index-name "$SITEMAP_INDEX_NAME" \
+            --link-column "$LINK_COL"
 
       - name: Verify output exists
         run: |
           test -d "${OUTPUT_DIR}" || (echo "Missing ${OUTPUT_DIR}" && exit 1)
           ls -la "${OUTPUT_DIR}"
+          if ! ls "${OUTPUT_DIR}/${SITEMAP_INDEX_NAME}" >/dev/null 2>&1; then
+            echo "${SITEMAP_INDEX_NAME} not found in ${OUTPUT_DIR}" && exit 1
+          fi
 
       # ---------- UPLOAD TO GCS ----------
-      - name: Upload sitemaps to GCS (to /sitemaps/)
+      - name: Upload sitemaps to GCS
         run: |
           gsutil -m rsync -r -d "${OUTPUT_DIR}" "gs://${GCS_BUCKET}/sitemaps"
 
-      - name: Set Cache-Control & Content-Type (optional)
+      - name: Set Cache-Control & Content-Type
         run: |
-          gsutil -m setmeta -h "Cache-Control:public, max-age=600" "gs://${GCS_BUCKET}/sitemaps/*.xml" || true
+          gsutil -m setmeta -h "Cache-Control:public, max-age=3600" "gs://${GCS_BUCKET}/sitemaps/*.xml" || true
 
       # ---------- PURGE CLOUDFLARE CACHE ----------
       - name: Purge Cloudflare cache for /sitemaps/*
-        if: ${{ env.CF_ZONE_ID != '' && env.CF_API_TOKEN != '' }}
+        env:
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: |
-          curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${{ env.CF_ZONE_ID }}/purge_cache" \
-            -H "Authorization: Bearer ${{ env.CF_API_TOKEN }}" \
+          curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            --data '{"files":["https://www.leeladiamond.com/sitemaps/sitemap-index.xml","https://www.leeladiamond.com/sitemaps/"]}'
+            --data '{"purge_everything":false,"files":["https://www.leeladiamond.com/sitemaps/"]}' | tee /tmp/cf_purge.json
+          echo "Cloudflare purge response:" && cat /tmp/cf_purge.json
