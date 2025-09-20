@@ -57,13 +57,12 @@ jobs:
           url = os.environ["CSV_URL"]
           link_col = os.environ.get("LINK_COL", "link")
           try:
-              # sample small chunk to confirm column exists
               df = pd.read_csv(url, dtype=str, nrows=5)
           except Exception as e:
               print(f"ERROR: Can't read CSV: {e}")
               sys.exit(1)
           if link_col not in df.columns:
-              print(f"ERROR: Column '{link_col}' not found in CSV. Found: {list(df.columns)}")
+              print(f"ERROR: Column '{link_col}' not found. Columns: {list(df.columns)}")
               sys.exit(1)
           print("CSV reachable and column present.")
           PY
@@ -106,7 +105,6 @@ jobs:
           os.makedirs(OUTPUT_DIR, exist_ok=True)
 
           def iter_links(csv_source, link_col="link", chunksize=200_000):
-            # Stream read (handles very large CSV)
             for chunk in pd.read_csv(csv_source, dtype=str, usecols=[link_col], chunksize=chunksize):
               series = chunk[link_col].dropna().astype(str).str.strip()
               for url in series[series.ne("")]:
@@ -117,10 +115,7 @@ jobs:
               f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
               f.write('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
               for u in urls:
-                # Basic XML-escape for & < >
-                u = (u.replace("&","&amp;")
-                       .replace("<","&lt;")
-                       .replace(">","&gt;"))
+                u = (u.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
                 f.write("  <url>\n")
                 f.write(f"    <loc>{u}</loc>\n")
                 f.write("  </url>\n")
@@ -141,11 +136,10 @@ jobs:
 
           links_iter = iter_links(CSV_URL, LINK_COL)
           buffer, part_names = [], []
-          count, part = 0, 1
+          part = 1
 
           for url in links_iter:
             buffer.append(url)
-            count += 1
             if len(buffer) >= PER_FILE:
               part_name = f"{SITEMAP_PREFIX}{part:05d}.xml"
               write_urlset_xml(os.path.join(OUTPUT_DIR, part_name), buffer)
@@ -202,17 +196,20 @@ jobs:
             -h "Content-Type:application/xml; charset=utf-8" \
             "gs://${GCS_BUCKET}/sitemaps/*.xml" || true
 
-      # ---------- PURGE CLOUDFLARE CACHE (optional) ----------
-      - name: Purge Cloudflare cache for sitemap index
-        if: ${{ secrets.CF_ZONE_ID != '' && secrets.CF_API_TOKEN != '' }}
+      # ---------- PURGE CLOUDFLARE CACHE (token & zone optional) ----------
+      - name: Purge Cloudflare cache for sitemap index (optional)
         env:
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           SITEMAP_INDEX_URL: ${{ env.PUBLIC_BASE_URL }}/${{ env.SITEMAP_INDEX_NAME }}
         run: |
-          echo "Purging Cloudflare cache for ${SITEMAP_INDEX_URL}"
-          curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            --data "{\"files\":[\"${SITEMAP_INDEX_URL}\"]}" | tee /tmp/cf_purge.json
-          echo "Cloudflare purge response:" && cat /tmp/cf_purge.json
+          if [ -n "${CF_ZONE_ID:-}" ] && [ -n "${CF_API_TOKEN:-}" ]; then
+            echo "Purging Cloudflare cache for ${SITEMAP_INDEX_URL}"
+            curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"files\":[\"${SITEMAP_INDEX_URL}\"]}" | tee /tmp/cf_purge.json
+            echo "Cloudflare purge response:" && cat /tmp/cf_purge.json
+          else
+            echo "CF_ZONE_ID or CF_API_TOKEN not set — skipping Cloudflare purge."
+          fi
