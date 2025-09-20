@@ -18,7 +18,7 @@ jobs:
       LINK_COL: link
       GCS_BUCKET: sitemaps.leeladiamond.com
       OUTPUT_DIR: ./sitemaps_out
-      PUBLIC_BASE_URL: https://www.leeladiamond.com/sitemaps   # << force WWW
+      PUBLIC_BASE_URL: https://www.leeladiamond.com/sitemaps   # force WWW
       PER_FILE: "50000"
       SITEMAP_INDEX_NAME: sitemap-index.xml
       SITEMAP_PREFIX: leela-products-
@@ -77,14 +77,75 @@ jobs:
           SITEMAP_PREFIX: ${{ env.SITEMAP_PREFIX }}
           SITEMAP_INDEX_NAME: ${{ env.SITEMAP_INDEX_NAME }}
         run: |
-          python generate_sitemaps.py \
-            --csv "${CSV_URL}" \
-            --outdir "${OUTPUT_DIR}" \
-            --public-base-url "${PUBLIC_BASE_URL}" \
-            --per-file "${PER_FILE}" \
-            --link-column "${LINK_COL}" \
-            --basename "${SITEMAP_PREFIX}" \
-            --index-name "${SITEMAP_INDEX_NAME}"
+          python - <<'PY'
+          # -*- coding: utf-8 -*-
+          import os, datetime as dt
+          import pandas as pd
+
+          CSV_URL = os.environ["CSV_URL"]
+          OUTPUT_DIR = os.environ["OUTPUT_DIR"]
+          PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
+          PER_FILE = int(os.environ.get("PER_FILE", "50000"))
+          LINK_COL = os.environ.get("LINK_COL", "link")
+          SITEMAP_PREFIX = os.environ.get("SITEMAP_PREFIX", "leela-products-")
+          SITEMAP_INDEX_NAME = os.environ.get("SITEMAP_INDEX_NAME", "sitemap-index.xml")
+
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+          def iter_links(csv_source, link_col="link", chunksize=200000):
+            for chunk in pd.read_csv(csv_source, dtype=str, usecols=[link_col], chunksize=chunksize):
+              for url in chunk[link_col].dropna().astype(str):
+                url = url.strip()
+                if url:
+                  yield url
+
+          def write_urlset_xml(file_path, urls):
+            with open(file_path, "w", encoding="utf-8", newline="") as f:
+              f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+              f.write('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
+              for u in urls:
+                u = u.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                f.write("  <url>\n")
+                f.write(f"    <loc>{u}</loc>\n")
+                f.write("  </url>\n")
+              f.write("</urlset>\n")
+
+          def write_index_xml(index_path, part_files):
+            now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+            with open(index_path, "w", encoding="utf-8", newline="") as f:
+              f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+              f.write('<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
+              for name in part_files:
+                loc = f"{PUBLIC_BASE_URL}/{name}"
+                f.write("  <sitemap>\n")
+                f.write(f"    <loc>{loc}</loc>\n")
+                f.write(f"    <lastmod>{now}</lastmod>\n")
+                f.write("  </sitemap>\n")
+              f.write("</sitemapindex>\n")
+
+          links_iter = iter_links(CSV_URL, LINK_COL)
+          buffer, part_names = [], []
+          part = 1
+
+          for url in links_iter:
+            buffer.append(url)
+            if len(buffer) >= PER_FILE:
+              part_name = f"{SITEMAP_PREFIX}{part:05d}.xml"
+              write_urlset_xml(os.path.join(OUTPUT_DIR, part_name), buffer)
+              part_names.append(part_name)
+              buffer.clear()
+              part += 1
+
+          if buffer:
+            part_name = f"{SITEMAP_PREFIX}{part:05d}.xml"
+            write_urlset_xml(os.path.join(OUTPUT_DIR, part_name), buffer)
+            part_names.append(part_name)
+
+          index_path = os.path.join(OUTPUT_DIR, SITEMAP_INDEX_NAME)
+          write_index_xml(index_path, part_names)
+
+          print(f"Generated {len(part_names)} sitemap part files; index at {index_path}")
+          PY
 
       - name: Verify files exist
         env:
@@ -95,33 +156,62 @@ jobs:
           ls -la "${OUTPUT_DIR}"
           test -f "${OUTPUT_DIR}/${SITEMAP_INDEX_NAME}" || (echo "${SITEMAP_INDEX_NAME} not found" && exit 1)
 
+      # ---------- upload to GCS ----------
       - name: Upload sitemaps to GCS (/sitemaps/)
         env:
           GCS_BUCKET: ${{ env.GCS_BUCKET }}
           OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
         run: |
           gsutil -m rsync -r -d "${OUTPUT_DIR}" "gs://${GCS_BUCKET}/sitemaps"
-          gsutil -m setmeta \
-            -h "Cache-Control:public, max-age=3600" \
-            -h "Content-Type:application/xml; charset=utf-8" \
-            "gs://${GCS_BUCKET}/sitemaps/*.xml" || true
+          # Set sensible cache headers (shorter for index)
+          gsutil setmeta -h "Cache-Control:public, max-age=300" "gs://${GCS_BUCKET}/sitemaps/${{ env.SITEMAP_INDEX_NAME }}" || true
+          gsutil -m setmeta -h "Cache-Control:public, max-age=3600" "gs://${GCS_BUCKET}/sitemaps/*.xml" || true
 
-      # optional: purge Cloudflare for the index (set these secrets to enable)
-      - name: Purge Cloudflare cache (optional)
+      # ---------- purge Cloudflare for all generated files ----------
+      - name: Purge Cloudflare cache for generated sitemaps (batched)
         env:
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           PUBLIC_BASE_URL: ${{ env.PUBLIC_BASE_URL }}
-          SITEMAP_INDEX_NAME: ${{ env.SITEMAP_INDEX_NAME }}
+          OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
         run: |
-          if [ -n "${CF_ZONE_ID:-}" ] && [ -n "${CF_API_TOKEN:-}" ]; then
-            URL="${PUBLIC_BASE_URL}/${SITEMAP_INDEX_NAME}"
-            echo "Purging CF cache for ${URL}"
+          if [ -z "${CF_ZONE_ID:-}" ] || [ -z "${CF_API_TOKEN:-}" ]; then
+            echo "CF secrets not set; skipping purge."
+            exit 0
+          fi
+
+          mapfile -t FILES < <(find "${OUTPUT_DIR}" -type f -name "*.xml" -printf "%f\n" | sort)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No files to purge."
+            exit 0
+          fi
+
+          # Build full URLs
+          URLS=()
+          for f in "${FILES[@]}"; do
+            URLS+=("${PUBLIC_BASE_URL}/${f}")
+          done
+
+          # Purge in batches of 30 (Cloudflare API limit)
+          i=0
+          total=${#URLS[@]}
+          while [ $i -lt $total ]; do
+            batch=( "${URLS[@]:$i:30}" )
+            json='{"files":['
+            first=1
+            for u in "${batch[@]}"; do
+              if [ $first -eq 1 ]; then first=0; else json+=','; fi
+              json+="\"$u\""
+            done
+            json+=']}'
+
+            echo "Purging ${#batch[@]} URLs..."
             curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
               -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: application/json" \
-              --data "{\"files\":[\"${URL}\"]}" | tee /tmp/cf_purge.json
-            cat /tmp/cf_purge.json
-          else
-            echo "CF secrets not set; skipping purge."
-          fi
+              --data "${json}" | tee /tmp/cf_purge_resp.json
+
+            i=$((i+30))
+          done
+
+          echo "Cloudflare purge complete."
