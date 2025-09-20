@@ -77,7 +77,7 @@ jobs:
           SITEMAP_PREFIX: ${{ env.SITEMAP_PREFIX }}
           SITEMAP_INDEX_NAME: ${{ env.SITEMAP_INDEX_NAME }}
         run: |
-          python scripts/generate_sitemaps.py \
+          python generate_sitemaps.py \
             --csv "${CSV_URL}" \
             --outdir "${OUTPUT_DIR}" \
             --public-base-url "${PUBLIC_BASE_URL}" \
