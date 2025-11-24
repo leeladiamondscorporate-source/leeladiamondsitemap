@@ -1,19 +1,44 @@
 name: 🗓️ Daily Sitemap Build & Publish
 
+# ---------------------------------------------------
+# Prevents auto-disabling by:
+# 1. Daily run
+# 2. Monthly keepalive ping that commits a no-op
+# ---------------------------------------------------
 on:
   schedule:
-    - cron: "0 1 * * *"   # every day at 01:00 UTC
-  workflow_dispatch:
+    - cron: "0 1 * * *"          # daily at 01:00 UTC
+    - cron: "0 0 1 * *"          # keepalive: first day of every month
+  workflow_dispatch:             # manual trigger keeps workflow active
 
 permissions:
-  contents: read
+  contents: write                # needed for keepalive commit
 
 jobs:
+  keepalive:
+    # This job only runs on the monthly cron
+    if: github.event.schedule == '0 0 1 * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Touch keepalive file
+        run: |
+          echo "last-run=$(date -u)" > .github/keepalive.txt
+
+      - name: Commit & Push Keepalive
+        run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          git add .github/keepalive.txt
+          git commit -m "Keepalive: prevent workflow disable" || echo "No changes"
+          git push
+
   build-publish:
     runs-on: ubuntu-latest
 
     env:
-      # ===== customize these =====
       CSV_URL: https://storage.googleapis.com/sitemaps.leeladiamond.com/Googlefinal/combined_google_merchant_feed.csv
       LINK_COL: link
       GCS_BUCKET: sitemaps.leeladiamond.com
@@ -22,7 +47,6 @@ jobs:
       PER_FILE: "50000"
       SITEMAP_INDEX_NAME: sitemap-index.xml
       SITEMAP_PREFIX: leela-products-
-      # ===========================
 
     steps:
       - name: Checkout repo
@@ -84,8 +108,6 @@ jobs:
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: |
-          # Purge the index and all part files (wildcards supported for Enterprise; otherwise purge index
-          # and a sample of parts or switch to a KV list). Here we purge the whole /sitemaps/ path via API.
           curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
