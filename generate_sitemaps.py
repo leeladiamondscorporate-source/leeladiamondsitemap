@@ -2,6 +2,7 @@
 import os, argparse, datetime
 import pandas as pd
 from urllib.parse import urlparse, urlunparse
+from xml.sax.saxutils import escape
 
 def normalize_url(u: str) -> str:
     """
@@ -27,25 +28,29 @@ def iter_links(csv_source, link_col="link", chunksize=200000):
                 yield url
 
 def write_urlset_xml(file_path, urls):
-    # Minimal, valid XML for large sitemaps
+    # Write sitemap with lastmod, priority, and changefreq for better crawl guidance
+    today = datetime.datetime.now(datetime.UTC).date().isoformat()
     with open(file_path, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
         f.write('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
         for u in urls:
             f.write("  <url>\n")
-            f.write(f"    <loc>{u}</loc>\n")
+            f.write(f"    <loc>{escape(u)}</loc>\n")
+            f.write(f"    <lastmod>{today}</lastmod>\n")
+            f.write("    <changefreq>weekly</changefreq>\n")
+            f.write("    <priority>0.8</priority>\n")
             f.write("  </url>\n")
         f.write("</urlset>\n")
 
 def write_index_xml(index_path, part_files, public_base_url):
-    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    now = datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     with open(index_path, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
         f.write('<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
         for name in part_files:
             loc = f"{public_base_url.rstrip('/')}/{name}"
             f.write("  <sitemap>\n")
-            f.write(f"    <loc>{loc}</loc>\n")
+            f.write(f"    <loc>{escape(loc)}</loc>\n")
             f.write(f"    <lastmod>{now}</lastmod>\n")
             f.write("  </sitemap>\n")
         f.write("</sitemapindex>\n")
@@ -66,7 +71,13 @@ def main():
     buffer, part_names = [], []
     part = 1
 
+    seen = set()
+
     for url in iter_links(args.csv, args.link_column):
+        if url in seen:
+            continue
+        seen.add(url)
+
         buffer.append(url)
         if len(buffer) >= args.per_file:
             part_name = f"{args.basename}{part:05d}.xml"
