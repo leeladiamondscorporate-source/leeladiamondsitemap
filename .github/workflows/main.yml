@@ -39,9 +39,9 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      CSV_URL: https://storage.googleapis.com/sitemaps.leeladiamond.com/Googlefinal/combined_google_merchant_feed.csv
+      CSV_URL: https://storage.googleapis.com/leela-asia/Googlefinal/combined_google_merchant_feed.csv
       LINK_COL: link
-      GCS_BUCKET: sitemaps.leeladiamond.com
+      GCS_BUCKET: leela-asia
       OUTPUT_DIR: ./sitemaps_out
       PUBLIC_BASE_URL: https://www.leeladiamond.com/sitemaps
       PER_FILE: "50000"
@@ -100,7 +100,7 @@ jobs:
 
       - name: Set Cache-Control & Content-Type
         run: |
-          gsutil -m setmeta -h "Cache-Control:public, max-age=3600" "gs://${GCS_BUCKET}/sitemaps/*.xml" || true
+          gsutil -m setmeta -h "Cache-Control:public, max-age=86400" "gs://${GCS_BUCKET}/sitemaps/*.xml" || true
 
       # ---------- PURGE CLOUDFLARE CACHE ----------
       - name: Purge Cloudflare cache for /sitemaps/*
