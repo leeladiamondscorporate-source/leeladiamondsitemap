@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      CSV_URL: https://feeds.leeladiamond.com/Googlefinal/combined_google_merchant_feed.csv
+      CSV_URL: ./combined_google_merchant_feed.csv
       LINK_COL: link
       R2_BUCKET: leela-feeds
       R2_PREFIX: sitemaps
@@ -65,6 +65,16 @@ jobs:
 
       - name: Install AWS CLI
         run: pip install awscli
+
+      - name: Download source feed from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          test -n "$R2_ENDPOINT" || (echo "Missing R2_ENDPOINT secret" && exit 1)
+          aws s3 cp "s3://${R2_BUCKET}/Googlefinal/combined_google_merchant_feed.csv" "$CSV_URL" --endpoint-url "$R2_ENDPOINT"
 
       # ---------- GENERATE SITEMAPS ----------
       - name: Generate sitemaps
