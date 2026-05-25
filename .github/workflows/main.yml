@@ -39,11 +39,12 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      CSV_URL: https://storage.googleapis.com/leela-asia/Googlefinal/combined_google_merchant_feed.csv
+      CSV_URL: https://feeds.leeladiamond.com/Googlefinal/combined_google_merchant_feed.csv
       LINK_COL: link
-      GCS_BUCKET: leela-asia
+      R2_BUCKET: leela-feeds
+      R2_PREFIX: sitemaps
       OUTPUT_DIR: ./sitemaps_out
-      PUBLIC_BASE_URL: https://www.leeladiamond.com/sitemaps
+      PUBLIC_BASE_URL: https://feeds.leeladiamond.com/sitemaps
       PER_FILE: "50000"
       SITEMAP_INDEX_NAME: sitemap-index.xml
       SITEMAP_PREFIX: leela-products-
@@ -62,16 +63,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas lxml requests
 
-      # ---------- AUTH TO GCP ----------
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Setup gcloud SDK (gsutil)
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          install_components: "gsutil"
+      - name: Install AWS CLI
+        run: pip install awscli
 
       # ---------- GENERATE SITEMAPS ----------
       - name: Generate sitemaps
@@ -93,14 +86,20 @@ jobs:
             echo "${SITEMAP_INDEX_NAME} not found in ${OUTPUT_DIR}" && exit 1
           fi
 
-      # ---------- UPLOAD TO GCS ----------
-      - name: Upload sitemaps to GCS
+      # ---------- UPLOAD TO R2 ----------
+      - name: Upload sitemaps to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
-          gsutil -m rsync -r -d "${OUTPUT_DIR}" "gs://${GCS_BUCKET}/sitemaps"
-
-      - name: Set Cache-Control & Content-Type
-        run: |
-          gsutil -m setmeta -h "Cache-Control:public, max-age=86400" "gs://${GCS_BUCKET}/sitemaps/*.xml" || true
+          aws s3 rm "s3://${R2_BUCKET}/${R2_PREFIX}" --recursive --endpoint-url "$R2_ENDPOINT" || true
+          aws s3 cp "${OUTPUT_DIR}" "s3://${R2_BUCKET}/${R2_PREFIX}" \
+            --recursive \
+            --endpoint-url "$R2_ENDPOINT" \
+            --content-type "application/xml" \
+            --cache-control "public, max-age=86400"
 
       # ---------- PURGE CLOUDFLARE CACHE ----------
       - name: Purge Cloudflare cache for /sitemaps/*
@@ -111,6 +110,6 @@ jobs:
           curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            --data '{"purge_everything":false,"files":["https://www.leeladiamond.com/sitemaps/sitemap-index.xml","https://www.leeladiamond.com/sitemaps/"]}' \
+            --data '{"purge_everything":false,"files":["https://feeds.leeladiamond.com/sitemaps/sitemap-index.xml","https://feeds.leeladiamond.com/sitemaps/"]}' \
             | tee /tmp/cf_purge.json
           echo "Cloudflare purge response:" && cat /tmp/cf_purge.json
