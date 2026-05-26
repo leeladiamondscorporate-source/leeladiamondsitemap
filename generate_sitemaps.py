@@ -4,10 +4,16 @@ import pandas as pd
 from urllib.parse import urlparse, urlunparse
 from xml.sax.saxutils import escape
 
+PRODUCT_DETAIL_PREFIXES = (
+    "/pages/lab-grown-diamonds/",
+    "/pages/natural-diamonds/",
+    "/pages/gemstones-diamonds/",
+)
+
 def normalize_url(u: str) -> str:
     """
-    Ensure URLs use https://www.leeladiamond.com and KEEP query strings.
-    We only strip fragments (#...) to keep URLs canonical for Google.
+    Ensure URLs use https://www.leeladiamond.com and strip fragments.
+    Product detail URLs should match the canonical path used by the site.
     """
     u = (u or "").strip()
     if not u:
@@ -15,17 +21,30 @@ def normalize_url(u: str) -> str:
     p = urlparse(u)
     if p.netloc.endswith("leeladiamond.com"):
         p = p._replace(scheme="https", netloc="www.leeladiamond.com")
-    # KEEP p.query; only drop fragment
+    if p.path.startswith(PRODUCT_DETAIL_PREFIXES):
+        p = p._replace(query="")
     return urlunparse(p._replace(fragment=""))
 
-def iter_links(csv_source, link_col="link", chunksize=200000):
+
+def path_matches(url, prefixes):
+    if not prefixes:
+        return True
+    return urlparse(url).path.startswith(tuple(prefixes))
+
+
+def iter_links(csv_source, link_col="link", chunksize=200000, include_prefixes=None, max_urls=None):
     # Stream read extremely large CSVs
+    yielded = 0
     for chunk in pd.read_csv(csv_source, dtype=str, usecols=[link_col], chunksize=chunksize):
         # preserve as-is (after normalization)
         for url in chunk[link_col].dropna().astype(str):
             url = normalize_url(url)
-            if url:
-                yield url
+            if not url or not path_matches(url, include_prefixes):
+                continue
+            yield url
+            yielded += 1
+            if max_urls and yielded >= max_urls:
+                return
 
 def write_urlset_xml(file_path, urls):
     # Write sitemap with lastmod, priority, and changefreq for better crawl guidance
@@ -60,11 +79,17 @@ def main():
     p.add_argument("--csv", required=True, help="CSV URL or path")
     p.add_argument("--outdir", required=True, help="Output directory")
     p.add_argument("--basename", default="sitemap-", help="Base name for part files")
-    p.add_argument("--per-file", type=int, default=50000, help="URLs per sitemap file (<= 50k)")
+    p.add_argument("--per-file", type=int, default=45000, help="URLs per sitemap file (must be <= 50k)")
     p.add_argument("--public-base-url", required=True, help="Base URL where sitemaps are hosted")
     p.add_argument("--index-name", default="sitemap-index.xml", help="Sitemap index filename")
     p.add_argument("--link-column", default="link", help="CSV column containing URLs")
+    p.add_argument("--include-prefix", action="append", default=[], help="Only include URLs whose path starts with this prefix. Can be repeated.")
+    p.add_argument("--product-details-only", action="store_true", help="Only include canonical diamond/gemstone detail page URLs")
+    p.add_argument("--max-urls", type=int, default=0, help="Stop after this many unique URLs. 0 means no cap.")
     args = p.parse_args()
+
+    if args.per_file > 50000:
+        raise ValueError("--per-file must be 50000 or lower")
 
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -72,8 +97,16 @@ def main():
     part = 1
 
     seen = set()
+    include_prefixes = list(args.include_prefix)
+    if args.product_details_only:
+        include_prefixes.extend(PRODUCT_DETAIL_PREFIXES)
 
-    for url in iter_links(args.csv, args.link_column):
+    for url in iter_links(
+        args.csv,
+        args.link_column,
+        include_prefixes=include_prefixes,
+        max_urls=args.max_urls or None,
+    ):
         if url in seen:
             continue
         seen.add(url)
