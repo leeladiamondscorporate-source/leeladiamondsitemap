@@ -9,6 +9,7 @@ PRODUCT_DETAIL_PREFIXES = (
     "/pages/natural-diamonds/",
     "/pages/gemstones-diamonds/",
 )
+DEFAULT_PUBLIC_BASE_URL = "https://www.leeladiamond.com/sitemaps"
 
 def normalize_url(u: str) -> str:
     """
@@ -74,22 +75,50 @@ def write_index_xml(index_path, part_files, public_base_url):
             f.write("  </sitemap>\n")
         f.write("</sitemapindex>\n")
 
+
+def normalize_public_base_url(value: str, allow_external_host: bool = False) -> str:
+    base = (value or DEFAULT_PUBLIC_BASE_URL).strip().rstrip("/")
+    parsed = urlparse(base)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError("--public-base-url must be an absolute https URL")
+
+    if parsed.scheme != "https":
+        raise ValueError("--public-base-url must use https")
+
+    if parsed.netloc in {"leeladiamond.com", "www.leeladiamond.com"}:
+        parsed = parsed._replace(netloc="www.leeladiamond.com")
+        return urlunparse(parsed)
+
+    if not allow_external_host:
+        raise ValueError(
+            "--public-base-url must be on www.leeladiamond.com. "
+            "Use --allow-external-sitemap-host only if that host is verified in Search Console."
+        )
+
+    return base
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--csv", required=True, help="CSV URL or path")
     p.add_argument("--outdir", required=True, help="Output directory")
-    p.add_argument("--basename", default="sitemap-", help="Base name for part files")
+    p.add_argument("--basename", default="leela-products-", help="Base name for part files")
     p.add_argument("--per-file", type=int, default=45000, help="URLs per sitemap file (must be <= 50k)")
-    p.add_argument("--public-base-url", required=True, help="Base URL where sitemaps are hosted")
+    p.add_argument("--public-base-url", default=DEFAULT_PUBLIC_BASE_URL, help="Base URL where sitemaps are hosted")
     p.add_argument("--index-name", default="sitemap-index.xml", help="Sitemap index filename")
     p.add_argument("--link-column", default="link", help="CSV column containing URLs")
     p.add_argument("--include-prefix", action="append", default=[], help="Only include URLs whose path starts with this prefix. Can be repeated.")
     p.add_argument("--product-details-only", action="store_true", help="Only include canonical diamond/gemstone detail page URLs")
     p.add_argument("--max-urls", type=int, default=0, help="Stop after this many unique URLs. 0 means no cap.")
+    p.add_argument("--allow-external-sitemap-host", action="store_true", help="Allow sitemap index child URLs to use a host other than www.leeladiamond.com")
     args = p.parse_args()
 
     if args.per_file > 50000:
         raise ValueError("--per-file must be 50000 or lower")
+
+    public_base_url = normalize_public_base_url(
+        args.public_base_url,
+        allow_external_host=args.allow_external_sitemap_host,
+    )
 
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -125,9 +154,10 @@ def main():
         part_names.append(part_name)
 
     index_path = os.path.join(args.outdir, args.index_name)
-    write_index_xml(index_path, part_names, args.public_base_url)
+    write_index_xml(index_path, part_names, public_base_url)
 
     print(f"Generated {len(part_names)} sitemap part files; index at {index_path}")
+    print(f"Sitemap child URLs use: {public_base_url}")
 
 if __name__ == "__main__":
     main()
