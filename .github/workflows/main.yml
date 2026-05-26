@@ -44,8 +44,8 @@ jobs:
       R2_BUCKET: leela-feeds
       R2_PREFIX: sitemaps
       OUTPUT_DIR: ./sitemaps_out
-      PUBLIC_BASE_URL: https://feeds.leeladiamond.com/sitemaps
-      PER_FILE: "50000"
+      PUBLIC_BASE_URL: https://www.leeladiamond.com/sitemaps
+      PER_FILE: "45000"
       SITEMAP_INDEX_NAME: sitemap-index.xml
       SITEMAP_PREFIX: leela-products-
 
@@ -120,6 +120,6 @@ jobs:
           curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            --data '{"purge_everything":false,"files":["https://feeds.leeladiamond.com/sitemaps/sitemap-index.xml","https://feeds.leeladiamond.com/sitemaps/"]}' \
+            --data '{"purge_everything":false,"files":["https://www.leeladiamond.com/sitemaps/sitemap-index.xml","https://www.leeladiamond.com/sitemaps/"]}' \
             | tee /tmp/cf_purge.json
           echo "Cloudflare purge response:" && cat /tmp/cf_purge.json
