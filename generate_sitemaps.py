@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-import os, argparse, datetime
-import pandas as pd
+import os, io, csv, argparse, datetime
+from contextlib import contextmanager
 from urllib.parse import urlparse, urlunparse
+from urllib.request import urlopen
 from xml.sax.saxutils import escape
 
+SITE_ORIGIN = "https://www.leeladiamond.com"
 PRODUCT_DETAIL_PREFIXES = (
     "/pages/lab-grown-diamonds/",
     "/pages/natural-diamonds/",
@@ -20,8 +22,16 @@ def normalize_url(u: str) -> str:
     if not u:
         return u
     p = urlparse(u)
-    if p.netloc.endswith("leeladiamond.com"):
+
+    if not p.scheme and not p.netloc and p.path.startswith("/"):
+        p = urlparse(f"{SITE_ORIGIN}{u}")
+
+    if p.netloc == "leeladiamond.com" or p.netloc.endswith(".leeladiamond.com"):
         p = p._replace(scheme="https", netloc="www.leeladiamond.com")
+
+    if p.scheme != "https" or p.netloc != "www.leeladiamond.com":
+        return ""
+
     if p.path.startswith(PRODUCT_DETAIL_PREFIXES):
         p = p._replace(query="")
     return urlunparse(p._replace(fragment=""))
@@ -33,12 +43,28 @@ def path_matches(url, prefixes):
     return urlparse(url).path.startswith(tuple(prefixes))
 
 
-def iter_links(csv_source, link_col="link", chunksize=200000, include_prefixes=None, max_urls=None):
-    # Stream read extremely large CSVs
+@contextmanager
+def open_csv_source(csv_source):
+    parsed = urlparse(csv_source)
+    if parsed.scheme in {"http", "https"}:
+        with urlopen(csv_source, timeout=300) as response:
+            wrapper = io.TextIOWrapper(response, encoding="utf-8-sig", newline="")
+            yield wrapper
+    else:
+        with open(csv_source, "r", encoding="utf-8-sig", newline="") as f:
+            yield f
+
+
+def iter_links(csv_source, link_col="link", include_prefixes=None, max_urls=None):
+    # Stream local CSVs and keep remote CSV handling dependency-free.
     yielded = 0
-    for chunk in pd.read_csv(csv_source, dtype=str, usecols=[link_col], chunksize=chunksize):
-        # preserve as-is (after normalization)
-        for url in chunk[link_col].dropna().astype(str):
+    with open_csv_source(csv_source) as source:
+        reader = csv.DictReader(source)
+        if not reader.fieldnames or link_col not in reader.fieldnames:
+            raise ValueError(f"CSV is missing required column: {link_col}")
+
+        for row in reader:
+            url = row.get(link_col, "")
             url = normalize_url(url)
             if not url or not path_matches(url, include_prefixes):
                 continue
@@ -152,6 +178,9 @@ def main():
         part_name = f"{args.basename}{part:05d}.xml"
         write_urlset_xml(os.path.join(args.outdir, part_name), buffer)
         part_names.append(part_name)
+
+    if not part_names:
+        raise ValueError("No sitemap URLs were generated. Check --csv, --link-column, and include filters.")
 
     index_path = os.path.join(args.outdir, args.index_name)
     write_index_xml(index_path, part_names, public_base_url)
